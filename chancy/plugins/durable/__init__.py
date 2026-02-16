@@ -37,6 +37,31 @@ Usage
     # From anywhere (caller must know the job ID):
     await DurablePlugin.emit_event(chancy, ref.id, "payment", {"amount": 99.99})
 
+Context Access
+--------------
+
+From any nested function called within a durable workflow, you can
+retrieve the current :class:`DurableContext` via
+:func:`get_current_context`:
+
+.. code-block:: python
+
+    from chancy.plugins.durable import get_current_context
+
+    async def helper():
+        ctx = get_current_context()
+        await ctx.step(some_step)
+
+Sleep
+-----
+
+The ``sleep()`` method accepts an optional ``name`` parameter for stable
+checkpoint names:
+
+.. code-block:: python
+
+    await ctx.sleep(3600, name="wait_for_cool_down")
+
 Versioning
 ----------
 
@@ -82,6 +107,36 @@ _durable_pool: contextvars.ContextVar = contextvars.ContextVar(
 _durable_prefix: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_durable_prefix", default="chancy_"
 )
+_current_context: contextvars.ContextVar["DurableContext | None"] = (
+    contextvars.ContextVar("_current_context", default=None)
+)
+
+
+def get_current_context() -> "DurableContext":
+    """Return the active :class:`DurableContext` for the calling task.
+
+    Must be called from within a running ``@durable()`` function or one
+    of its callees.
+
+    :raises RuntimeError: If called outside a durable execution context.
+    """
+    ctx = _current_context.get()
+    if ctx is None:
+        raise RuntimeError(
+            "get_current_context() must be called from within a "
+            "@durable() function."
+        )
+    return ctx
+
+
+class CancelledDurable(Exception):
+    """Raised when a durable job has been cancelled.
+
+    Checked at each checkpoint (``step()``, ``sleep()``,
+    ``wait_for_event()``).  If the job's state has been set to
+    ``'failed'`` by :meth:`DurablePlugin.cancel_durable_job`, this
+    exception is raised to abort the running function.
+    """
 
 
 class SuspendExecution(BaseException):
@@ -128,6 +183,7 @@ class DurableContext:
         self._checkpoints: dict[str, Any] = {}
         self._accessed_steps: set[str] = set()
         self._step_counts: dict[str, int] = {}
+        self._event_counts: dict[str, int] = {}
         # Auto-incrementing counter for sleep checkpoints. Produces
         # __sleep__0, __sleep__1, etc. Resets each replay (new instance).
         self._sleep_count: int = 0
@@ -162,6 +218,7 @@ class DurableContext:
         :param name: Explicit step name. Defaults to ``fn.__qualname__``.
         :returns: The step result.
         """
+        await self._check_cancelled()
         base_name = name or fn.__qualname__
         count = self._step_counts.get(base_name, 0)
         self._step_counts[base_name] = count + 1
@@ -181,20 +238,36 @@ class DurableContext:
         self._checkpoints[step_name] = result
         return result
 
-    async def sleep(self, seconds: int | float) -> None:
+    async def sleep(
+        self,
+        seconds: int | float,
+        *,
+        name: str | None = None,
+    ) -> None:
         """Suspend the durable function for *seconds*.
 
         The job is re-queued with ``scheduled_at`` set to
         ``now + seconds``.  On resume, all prior steps replay from
         checkpoints.
+
+        :param seconds: Duration to sleep in seconds.
+        :param name: Optional stable name for the sleep checkpoint.
+            If provided, uses ``__sleep__{name}`` instead of an
+            auto-incremented counter, making the checkpoint stable
+            across code changes.
         """
+        await self._check_cancelled()
         from datetime import timedelta
 
         wake_at = datetime.now(tz=timezone.utc) + timedelta(seconds=seconds)
 
-        # Uses __sleep__N naming to avoid collisions with user step names.
-        # Counter resets each replay, so sleep ordering must be stable.
-        checkpoint_name = f"__sleep__{self._sleep_count}"
+        if name is not None:
+            checkpoint_name = f"__sleep__{name}"
+        else:
+            # Uses __sleep__N naming to avoid collisions with user step
+            # names.  Counter resets each replay, so sleep ordering must
+            # be stable.
+            checkpoint_name = f"__sleep__{self._sleep_count}"
         self._sleep_count += 1
         if checkpoint_name in self._checkpoints:
             self._accessed_steps.add(checkpoint_name)
@@ -219,14 +292,27 @@ class DurableContext:
         Events are scoped to the current job — only events emitted
         targeting this job's ID will match.
 
+        When the same event name is waited on more than once, an
+        auto-incrementing suffix is appended:
+        ``__event__name``, ``__event__name#1``, ...
+
         :param event_name: The event name to wait for.
         :param timeout: Optional timeout in seconds. If the event is not
             emitted within this time, returns ``None``.
         :returns: The event payload, or ``None`` on timeout.
         """
+        await self._check_cancelled()
+
         # __event__ prefix reserves this namespace for internal
         # checkpoints, avoiding collisions with user step names.
-        checkpoint_name = f"__event__{event_name}"
+        # Auto-increment for repeated waits on the same event name.
+        count = self._event_counts.get(event_name, 0)
+        self._event_counts[event_name] = count + 1
+        checkpoint_name = (
+            f"__event__{event_name}#{count}"
+            if count > 0
+            else f"__event__{event_name}"
+        )
 
         # Already have a checkpoint for this event
         if checkpoint_name in self._checkpoints:
@@ -290,6 +376,49 @@ class DurableContext:
                         },
                     )
 
+        # Race window: emit_event may have fired between our SELECT
+        # and the INSERT.  Re-check in a short transaction before
+        # suspending.
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        sql.SQL("""
+                            SELECT payload
+                            FROM {events}
+                            WHERE job_id = %(job_id)s
+                              AND event_name = %(event_name)s
+                        """).format(
+                            events=sql.Identifier(f"{prefix}durable_events"),
+                        ),
+                        {
+                            "job_id": self._job.id,
+                            "event_name": event_name,
+                        },
+                    )
+                    row = await cursor.fetchone()
+                    if row is not None:
+                        # Event arrived during the window — clean up the
+                        # wait row and return immediately.
+                        payload = row["payload"]
+                        await cursor.execute(
+                            sql.SQL("""
+                                DELETE FROM {waits}
+                                WHERE job_id = %(job_id)s
+                                  AND step_name = %(step_name)s
+                            """).format(
+                                waits=sql.Identifier(f"{prefix}durable_waits"),
+                            ),
+                            {
+                                "job_id": self._job.id,
+                                "step_name": checkpoint_name,
+                            },
+                        )
+                        await self._save_checkpoint(checkpoint_name, payload)
+                        self._checkpoints[checkpoint_name] = payload
+                        self._accessed_steps.add(checkpoint_name)
+                        return payload
+
         # Suspend AFTER the transaction commits so the wait row is
         # visible to concurrent emit_event calls.
         raise SuspendExecution(
@@ -320,6 +449,33 @@ class DurableContext:
                     {"job_id": self._job.id, "step_name": name},
                 )
         self._checkpoints.pop(name, None)
+
+    async def _check_cancelled(self) -> None:
+        """Check if this job has been cancelled.
+
+        Queries the job's current state from the database.  If the state
+        is ``'failed'``, raises :class:`CancelledDurable`.
+        """
+        pool = _durable_pool.get()
+        prefix = _durable_prefix.get()
+
+        async with pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    sql.SQL("""
+                        SELECT state
+                        FROM {jobs}
+                        WHERE id = %(job_id)s
+                    """).format(
+                        jobs=sql.Identifier(f"{prefix}jobs"),
+                    ),
+                    {"job_id": self._job.id},
+                )
+                row = await cursor.fetchone()
+                if row is not None and row["state"] == "failed":
+                    raise CancelledDurable(
+                        f"Durable job {self._job.id} has been cancelled."
+                    )
 
     async def _load_checkpoints(self) -> None:
         pool = _durable_pool.get()
@@ -424,12 +580,15 @@ def durable(**job_kwargs):
         async def wrapper(*, _chancy_job: QueuedJob, **_kwargs):
             ctx = DurableContext(_chancy_job)
             await ctx._load_checkpoints()
+            token = _current_context.set(ctx)
             try:
                 result = await fn(ctx)
                 await ctx._on_complete()
                 return result
             except SuspendExecution as suspend:
                 raise _DurableSuspend(suspend) from None
+            finally:
+                _current_context.reset(token)
 
         wrapper.__module__ = fn.__module__
         wrapper.__qualname__ = fn.__qualname__
@@ -474,7 +633,7 @@ class DurablePlugin(Plugin):
                             DELETE FROM {waits} w
                             WHERE w.timeout_at IS NOT NULL
                               AND w.timeout_at <= NOW()
-                            RETURNING w.job_id, w.step_name
+                            RETURNING w.job_id, w.step_name, w.event_name
                         """).format(
                             waits=sql.Identifier(
                                 f"{chancy.prefix}durable_waits"
@@ -485,15 +644,39 @@ class DurablePlugin(Plugin):
                     if not expired:
                         return
 
-                    # Save a None checkpoint for each expired wait so
-                    # on replay wait_for_event returns None immediately
+                    # Save a checkpoint for each expired wait so on
+                    # replay wait_for_event returns immediately.  If
+                    # emit_event fired concurrently and the event now
+                    # exists, use its payload instead of null.
                     for row in expired:
+                        await cursor.execute(
+                            sql.SQL("""
+                                SELECT payload
+                                FROM {events}
+                                WHERE job_id = %(job_id)s
+                                  AND event_name = %(event_name)s
+                            """).format(
+                                events=sql.Identifier(
+                                    f"{chancy.prefix}durable_events"
+                                ),
+                            ),
+                            {
+                                "job_id": row["job_id"],
+                                "event_name": row["event_name"],
+                            },
+                        )
+                        event_row = await cursor.fetchone()
+                        if event_row is not None:
+                            result_val = json_dumps(event_row["payload"])
+                        else:
+                            result_val = "null"
                         await cursor.execute(
                             sql.SQL("""
                                 INSERT INTO {checkpoints}
                                     (job_id, step_name, result)
                                 VALUES
-                                    (%(job_id)s, %(step_name)s, 'null')
+                                    (%(job_id)s, %(step_name)s,
+                                     %(result)s)
                                 ON CONFLICT (job_id, step_name) DO NOTHING
                             """).format(
                                 checkpoints=sql.Identifier(
@@ -503,6 +686,7 @@ class DurablePlugin(Plugin):
                             {
                                 "job_id": row["job_id"],
                                 "step_name": row["step_name"],
+                                "result": result_val,
                             },
                         )
 
@@ -690,6 +874,8 @@ class DurablePlugin(Plugin):
 
         :param chancy: The Chancy application instance.
         :param job_id: The job ID to cancel.
+        :raises ValueError: If the job is currently running and cannot
+            be cancelled immediately.
         """
         async with chancy.pool.connection() as conn:
             async with conn.transaction():
@@ -711,16 +897,23 @@ class DurablePlugin(Plugin):
                             SET state = 'failed',
                                 completed_at = NOW()
                             WHERE id = %(job_id)s
+                              AND state != 'running'
+                            RETURNING id
                         """).format(
                             jobs=sql.Identifier(f"{chancy.prefix}jobs"),
                         ),
                         {"job_id": job_id},
                     )
+                    if cursor.rowcount == 0:
+                        raise ValueError(
+                            f"Cannot cancel job {job_id}: job is "
+                            f"currently running"
+                        )
 
     @classmethod
     async def rewind_to_step(
         cls, chancy: Chancy, job_id: str, step_name: str
-    ) -> None:
+    ) -> bool:
         """Rewind a durable job to a specific step.
 
         Deletes the named checkpoint and all subsequent ones (by
@@ -731,7 +924,9 @@ class DurablePlugin(Plugin):
         :param chancy: The Chancy application instance.
         :param job_id: The job ID to rewind.
         :param step_name: The checkpoint to rewind to.
-        :raises ValueError: If the checkpoint does not exist.
+        :returns: ``True`` if the job was successfully rewound.
+        :raises ValueError: If the checkpoint does not exist or the job
+            is currently running.
         """
         async with chancy.pool.connection() as conn:
             async with conn.transaction():
@@ -790,7 +985,7 @@ class DurablePlugin(Plugin):
                         {"job_id": job_id},
                     )
 
-                    # Re-queue the job
+                    # Re-queue the job (only if not currently running)
                     await cursor.execute(
                         sql.SQL("""
                             UPDATE {jobs}
@@ -798,6 +993,7 @@ class DurablePlugin(Plugin):
                                 scheduled_at = NOW(),
                                 completed_at = NULL
                             WHERE id = %(job_id)s
+                              AND state != 'running'
                             RETURNING queue
                         """).format(
                             jobs=sql.Identifier(f"{chancy.prefix}jobs"),
@@ -805,12 +1001,17 @@ class DurablePlugin(Plugin):
                         {"job_id": job_id},
                     )
                     result = await cursor.fetchone()
-                    if result:
-                        await chancy.notify(
-                            cursor,
-                            "queue.pushed",
-                            {"q": result["queue"]},
+                    if result is None:
+                        raise ValueError(
+                            f"Cannot rewind job {job_id}: job is "
+                            f"currently running"
                         )
+                    await chancy.notify(
+                        cursor,
+                        "queue.pushed",
+                        {"q": result["queue"]},
+                    )
+                    return True
 
     @classmethod
     async def get_job_checkpoints(
